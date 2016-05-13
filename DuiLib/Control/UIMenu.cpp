@@ -155,9 +155,16 @@ BOOL CMenuWnd::Receive(ContextMenuParam param)
 	return TRUE;
 }
 
+CMenuWnd* CMenuWnd::CreateMenu(CMenuElementUI* pOwner, STRINGorID xml, POINT point, CPaintManagerUI* pMainPaintManager, std::map<CDuiString, bool>* pMenuCheckInfo /*= NULL*/, DWORD dwAlignment /*= eMenuAlignment_Left | eMenuAlignment_Top*/)
+{
+	CMenuWnd* pMenu = new CMenuWnd;
+	pMenu->Init(pOwner, xml, point, pMainPaintManager, pMenuCheckInfo, dwAlignment);
+	return pMenu;
+}
+
 void CMenuWnd::Init(CMenuElementUI* pOwner, STRINGorID xml, POINT point,
-					CPaintManagerUI* pMainPaintManager, std::map<CDuiString,bool>* pMenuCheckInfo/* = NULL*/,
-					DWORD dwAlignment/* = eMenuAlignment_Left | eMenuAlignment_Top*/)
+					CPaintManagerUI* pMainPaintManager, std::map<CDuiString,bool>* pMenuCheckInfo,
+					DWORD dwAlignment)
 {
 
 	m_BasedPoint = point;
@@ -232,13 +239,15 @@ void CMenuWnd::OnFinalMessage(HWND hWnd)
 		}
 		m_pOwner->m_pWindow = NULL;
 		m_pOwner->m_uButtonState &= ~ UISTATE_PUSHED;
-		m_pOwner->Invalidate();
+		m_pOwner->Invalidate();	
 	}
-    delete this;
+	delete this;
 }
 
 LRESULT CMenuWnd::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled)
 {
+	bool bShowShadow = false;
+
 	if( m_pOwner != NULL) {
 		LONG styleValue = ::GetWindowLong(*this, GWL_STYLE);
 		styleValue &= ~WS_CAPTION;
@@ -268,11 +277,14 @@ LRESULT CMenuWnd::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandl
 			}
 		}
 
-		CShadowUI *pShadow = m_pOwner->GetManager()->GetShadow();
-		pShadow->CopyShadow(m_pm.GetShadow());
-
+		CShadowUI *pShadow = m_pm.GetShadow();
+		m_pOwner->GetManager()->GetShadow()->CopyShadow(pShadow);
+		bShowShadow = pShadow->IsShowShadow();
 		pShadow->ShowShadow(false);
 
+		m_pm.SetUseLayeredWindow(m_pOwner->GetManager()->IsLayeredWindow());
+		m_pm.SetUseGdiplusText(m_pOwner->GetManager()->IsUseGdiplusText());
+		
 		m_pm.AttachDialog(m_pLayout);
 		m_pm.AddNotifier(this);
 		
@@ -284,14 +296,18 @@ LRESULT CMenuWnd::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandl
 		CDialogBuilder builder;
 
 		CControlUI* pRoot = builder.Create(m_xml,UINT(0), this, &m_pm);
-		m_pm.GetShadow()->ShowShadow(false);
+
+		CShadowUI *pShadow = m_pm.GetShadow();
+		bShowShadow = pShadow->IsShowShadow();
+		pShadow->ShowShadow(false);
+
 		m_pm.AttachDialog(pRoot);
 		m_pm.AddNotifier(this);
 
 		ResizeMenu();
 	}
 
-	m_pm.GetShadow()->ShowShadow(true);
+	m_pm.GetShadow()->ShowShadow(bShowShadow);
 	m_pm.GetShadow()->Create(&m_pm);
 	return 0;
 }
@@ -544,6 +560,7 @@ LRESULT CMenuWnd::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 /////////////////////////////////////////////////////////////////////////////////////
 //
 
+CDuiString CMenuElementUI::s_clickedMenuItem;
 CMenuElementUI::CMenuElementUI():
 m_pWindow(NULL),
 m_bDrawLine(false),
@@ -600,18 +617,19 @@ void CMenuElementUI::DoPaint(HDC hDC, const RECT& rcPaint)
 
 void CMenuElementUI::DrawItemIcon(HDC hDC, const RECT& rcItem)
 {
-	if ( m_strIcon != _T("") )
-	{
-		
+	if ( m_icon.IsLoadSuccess() )
+	{	
 		if (!(m_bCheckItem && !GetChecked()))
 		{
-			CDuiString pStrImage;
-			pStrImage.Format(_T("file='%s' dest='%d,%d,%d,%d'"), m_strIcon.GetData(), 
-				(ITEM_DEFAULT_ICON_WIDTH - m_szIconSize.cx)/2,
-				(m_cxyFixed.cy - m_szIconSize.cy)/2,
-				(ITEM_DEFAULT_ICON_WIDTH - m_szIconSize.cx)/2 + m_szIconSize.cx,
-				(m_cxyFixed.cy - m_szIconSize.cy)/2 + m_szIconSize.cy);
-			CRenderEngine::DrawImageString(hDC, m_pManager, m_rcItem, m_rcPaint, pStrImage, _T(""));
+			RECT rcDest =
+			{
+				(ITEM_DEFAULT_ICON_WIDTH - m_szIconSize.cx) / 2,
+				(m_cxyFixed.cy - m_szIconSize.cy) / 2,
+				(ITEM_DEFAULT_ICON_WIDTH - m_szIconSize.cx) / 2 + m_szIconSize.cx,
+				(m_cxyFixed.cy - m_szIconSize.cy) / 2 + m_szIconSize.cy 
+			};
+			
+			DrawImage(hDC, m_icon, rcDest);
 		}			
 	}
 }
@@ -620,16 +638,25 @@ void CMenuElementUI::DrawItemExpland(HDC hDC, const RECT& rcItem)
 {
 	if (m_bShowExplandIcon)
 	{
-		CDuiString strExplandIcon;
-		strExplandIcon = GetManager()->GetDefaultAttributeList(_T("ExplandIcon"));
-		CDuiString strBkImage;
-		strBkImage.Format(_T("file='%s' dest='%d,%d,%d,%d'"), strExplandIcon.GetData(), 
-			m_cxyFixed.cx - ITEM_DEFAULT_EXPLAND_ICON_WIDTH + (ITEM_DEFAULT_EXPLAND_ICON_WIDTH - ITEM_DEFAULT_EXPLAND_ICON_SIZE)/2,
-			(m_cxyFixed.cy - ITEM_DEFAULT_EXPLAND_ICON_SIZE)/2,
-			m_cxyFixed.cx - ITEM_DEFAULT_EXPLAND_ICON_WIDTH + (ITEM_DEFAULT_EXPLAND_ICON_WIDTH - ITEM_DEFAULT_EXPLAND_ICON_SIZE)/2 + ITEM_DEFAULT_EXPLAND_ICON_SIZE,
-			(m_cxyFixed.cy - ITEM_DEFAULT_EXPLAND_ICON_SIZE)/2 + ITEM_DEFAULT_EXPLAND_ICON_SIZE);
+		if (!m_expandIcon.IsLoadSuccess())
+		{
+			m_expandIcon.SetAttributeString(GetManager()->GetDefaultAttributeList(_T("ExplandIcon")));
+		}
+		
+		if (!m_expandIcon.LoadImage(m_pManager))
+			return;
 
-		CRenderEngine::DrawImageString(hDC, m_pManager, m_rcItem, m_rcPaint, strBkImage, _T(""));
+		const TImageInfo *pImageInfo = m_expandIcon.GetImageInfo();
+		
+		RECT rcDest =
+		{
+			m_cxyFixed.cx - ITEM_DEFAULT_EXPLAND_ICON_WIDTH + (ITEM_DEFAULT_EXPLAND_ICON_WIDTH - pImageInfo->nX) / 2,
+			(m_cxyFixed.cy - pImageInfo->nY) / 2,
+			m_cxyFixed.cx - ITEM_DEFAULT_EXPLAND_ICON_WIDTH + (ITEM_DEFAULT_EXPLAND_ICON_WIDTH - pImageInfo->nX) / 2 + pImageInfo->nX,
+			(m_cxyFixed.cy - pImageInfo->nY) / 2 + pImageInfo->nY
+		};
+
+		DrawImage(hDC, m_expandIcon, rcDest);
 	}
 }
 
@@ -773,9 +800,8 @@ void CMenuElementUI::DoEvent(TEventUI& event)
 				SetChecked(!GetChecked());
 				if (CMenuWnd::GetGlobalContextMenuObserver().GetManager() != NULL)
 				{
-					CDuiString* strPost = new CDuiString(GetName().GetData());
-					if (!PostMessage(CMenuWnd::GetGlobalContextMenuObserver().GetManager()->GetPaintWindow(), WM_MENUCLICK, (WPARAM)(strPost), (LPARAM)(GetChecked() == TRUE)))
-						delete strPost;
+					s_clickedMenuItem = GetName();
+					PostMessage(CMenuWnd::GetGlobalContextMenuObserver().GetManager()->GetPaintWindow(), WM_MENUCLICK, (WPARAM)(&s_clickedMenuItem), (LPARAM)(GetChecked() ? TRUE : FALSE));
 				}
 				ContextMenuParam param;
 				param.hWnd = m_pManager->GetPaintWindow();
@@ -838,7 +864,7 @@ void CMenuElementUI::CreateMenuWnd()
 	param.wParam = 2;
 	CMenuWnd::GetGlobalContextMenuObserver().RBroadcast(param);
 
-	m_pWindow->Init(static_cast<CMenuElementUI*>(this), _T(""), CPoint(), NULL);
+	m_pWindow->Init(static_cast<CMenuElementUI*>(this), _T(""), CPoint(), NULL, NULL, eMenuAlignment_Left | eMenuAlignment_Top);
 }
 
 void CMenuElementUI::SetLineType()
@@ -873,8 +899,8 @@ RECT CMenuElementUI::GetLinePadding() const
 
 void CMenuElementUI::SetIcon(LPCTSTR strIcon)
 {
-	if ( strIcon != _T("") )
-		m_strIcon = strIcon;
+	if (strIcon != _T(""))
+		m_icon.SetAttributeString(strIcon);
 }
 
 void CMenuElementUI::SetIconSize(LONG cx, LONG cy)

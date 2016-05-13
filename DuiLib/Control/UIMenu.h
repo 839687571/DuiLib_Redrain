@@ -27,13 +27,12 @@ enum MenuAlignment
 enum MenuItemDefaultInfo
 {
 	ITEM_DEFAULT_HEIGHT = 30,		//每一个item的默认高度（只在竖状排列时自定义）
-	ITEM_DEFAULT_WIDTH = 150,		//窗口的默认宽度
+	ITEM_DEFAULT_WIDTH = 130,		//窗口的默认宽度
 
 	ITEM_DEFAULT_ICON_WIDTH = 26,	//默认图标所占宽度
 	ITEM_DEFAULT_ICON_SIZE = 16,	//默认图标的大小
 
 	ITEM_DEFAULT_EXPLAND_ICON_WIDTH = 20,	//默认下级菜单扩展图标所占宽度
-	ITEM_DEFAULT_EXPLAND_ICON_SIZE = 9,		//默认下级菜单扩展图标的大小
 
 	DEFAULT_LINE_LEFT_INSET = ITEM_DEFAULT_ICON_WIDTH + 3,	//默认分隔线的左边距
 	DEFAULT_LINE_RIGHT_INSET = 7,	//默认分隔线的右边距
@@ -273,16 +272,17 @@ public:
 	~CMenuWnd();
 
 	/*
-	 *	@pOwner 一级菜单不要指定这个参数，这是菜单内部使用的
-	 *	@xml	菜单的布局文件
-	 *	@point	菜单的左上角坐标
-	 *	@pMainPaintManager	菜单的父窗体管理器指针
-	 *	@pMenuCheckInfo	保存菜单的单选和复选信息结构指针
-	 *	@dwAlignment		菜单的出现位置，默认出现在鼠标的右下侧。
-	 */
-    void Init(CMenuElementUI* pOwner, STRINGorID xml, POINT point,
-		CPaintManagerUI* pMainPaintManager, std::map<CDuiString,bool>* pMenuCheckInfo = NULL,
+	*	@pOwner 一级菜单不要指定这个参数，这是菜单内部使用的
+	*	@xml	菜单的布局文件
+	*	@point	菜单的左上角坐标
+	*	@pMainPaintManager	菜单的父窗体管理器指针
+	*	@pMenuCheckInfo	保存菜单的单选和复选信息结构指针
+	*	@dwAlignment		菜单的出现位置，默认出现在鼠标的右下侧。
+	*/
+	static CMenuWnd* CreateMenu(CMenuElementUI* pOwner, STRINGorID xml, POINT point,
+		CPaintManagerUI* pMainPaintManager, std::map<CDuiString, bool>* pMenuCheckInfo = NULL,
 		DWORD dwAlignment = eMenuAlignment_Left | eMenuAlignment_Top);
+
     LPCTSTR GetWindowClassName() const;
     void OnFinalMessage(HWND hWnd);
 	void Notify(TNotifyUI& msg);
@@ -304,14 +304,20 @@ public:
 	// 重新调整子菜单的大小
 	void ResizeSubMenu();
 
-public:
+private:
+	friend class CMenuElementUI;
+	void Init(CMenuElementUI* pOwner, STRINGorID xml, POINT point,
+		CPaintManagerUI* pMainPaintManager, std::map<CDuiString, bool>* pMenuCheckInfo,
+		DWORD dwAlignment);
+
+private:
 
 	POINT			m_BasedPoint;
 	STRINGorID		m_xml;
     CPaintManagerUI m_pm;
     CMenuElementUI* m_pOwner;
-    CMenuUI*	m_pLayout;
-	DWORD		m_dwAlignment;	//菜单对齐方式
+    CMenuUI*		m_pLayout;
+	DWORD			m_dwAlignment;	//菜单对齐方式
 };
 
 class CListContainerElementUI;
@@ -351,18 +357,22 @@ public:
 
 	void SetAttribute(LPCTSTR pstrName, LPCTSTR pstrValue);
 
+
 protected:
 	CMenuWnd*	m_pWindow;
 
 	bool		m_bDrawLine;	//画分隔线
 	DWORD		m_dwLineColor;  //分隔线颜色
-	RECT		m_rcLinePadding;	//分割线的左右边距
+	RECT		m_rcLinePadding;//分割线的左右边距
 
 	SIZE		m_szIconSize; 	//画图标
-	CDuiString	m_strIcon;
 	bool		m_bCheckItem;
+	CImageAttribute m_icon;
 
 	bool		m_bShowExplandIcon;
+	CImageAttribute m_expandIcon;
+
+	static CDuiString	s_clickedMenuItem;	//被单击的菜单项名字
 };
 
 } // namespace DuiLib

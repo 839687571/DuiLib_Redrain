@@ -1,12 +1,7 @@
 #include "StdAfx.h"
 #include <zmouse.h>
+#include "Utils/ThirdParty.h"
 
-DECLARE_HANDLE(HZIP);	// An HZIP identifies a zip file that has been opened
-typedef DWORD ZRESULT;
-#define OpenZip OpenZipU
-#define CloseZip(hz) CloseZipU(hz)
-extern HZIP OpenZipU(void *z,unsigned int len,DWORD flags);
-extern ZRESULT CloseZipU(HZIP hz);
 
 namespace DuiLib {
 
@@ -51,9 +46,11 @@ typedef struct tagTIMERINFO
 /////////////////////////////////////////////////////////////////////////////////////
 
 HPEN m_hUpdateRectPen = NULL;
+ULONG_PTR CPaintManagerUI::m_gdiplusToken;
+Gdiplus::GdiplusStartupInput* CPaintManagerUI::m_pGdiplusStartupInput = NULL;
 HINSTANCE CPaintManagerUI::m_hInstance = NULL;
 HINSTANCE CPaintManagerUI::m_hResourceInstance = NULL;
-CDuiString CPaintManagerUI::m_pStrDefaultFontName;//added by cddjr at 05/18/2012
+CDuiString CPaintManagerUI::m_pStrDefaultFontName;
 CDuiString CPaintManagerUI::m_pStrResourcePath;
 CDuiString CPaintManagerUI::m_pStrResourceZip;
 bool CPaintManagerUI::m_bCachedResourceZip = false;
@@ -63,7 +60,11 @@ short CPaintManagerUI::m_S = 100;
 short CPaintManagerUI::m_L = 100;
 CStdPtrArray CPaintManagerUI::m_aPreMessages;
 CStdPtrArray CPaintManagerUI::m_aPlugins;
-const UINT kCaretTimerID = 0xF1;
+
+namespace
+{
+	const UINT kCaretTimerID = 0xF1;
+}
 
 CPaintManagerUI::CPaintManagerUI() :
 m_hWndPaint(NULL),
@@ -71,9 +72,15 @@ m_hDcPaint(NULL),
 m_hDcOffscreen(NULL),
 m_hbmpOffscreen(NULL),
 m_pBmpOffscreenBits(NULL),
-m_bOffscreenPaint(true),
-m_bAlphaBackground(false),
+
+m_nOpacity(255),
+m_bLayeredWindow(false),
 m_bIsRestore(false),
+m_bUseGdiplusText(false),
+
+m_bCaretActive(false),
+m_bCaretShowing(false),
+m_pCurrentCaretRichedit(NULL),
 
 m_hwndTooltip(NULL),
 m_uTimerID(0x1000),
@@ -88,12 +95,7 @@ m_bUpdateNeeded(false),
 m_bMouseTracking(false),
 m_bMouseCapture(false),
 m_bUsedVirtualWnd(false),
-m_nOpacity(255),
-m_pParentResourcePM(NULL),
-m_bCaretActive(false),
-m_bCaretShowing(false),
-m_currentCaretObject(NULL),
-m_bUseGdiplusText(false)
+m_pParentResourcePM(NULL)
 {
     m_dwDefaultDisabledColor = 0xFFA7A6AA;
     m_dwDefaultFontColor = 0xFF000001;
@@ -124,9 +126,6 @@ m_bUseGdiplusText(false)
         ::LoadLibrary(_T("msimg32.dll"));
     }
 
-	m_pGdiplusStartupInput = new Gdiplus::GdiplusStartupInput;
-	Gdiplus::GdiplusStartup( &m_gdiplusToken, m_pGdiplusStartupInput, NULL); // 加载GDI接口
-
     m_szMinWindow.cx = 0;
     m_szMinWindow.cy = 0;
     m_szMaxWindow.cx = 0;
@@ -136,8 +135,9 @@ m_bUseGdiplusText(false)
     m_szRoundCorner.cx = m_szRoundCorner.cy = 0;
     ::ZeroMemory(&m_rcSizeBox, sizeof(m_rcSizeBox));
     ::ZeroMemory(&m_rcCaption, sizeof(m_rcCaption));
-	::ZeroMemory(&m_rtCaret, sizeof(m_rtCaret));
+	::ZeroMemory(&m_rcCaret, sizeof(m_rcCaret));
 	::ZeroMemory(&m_rcInvalidate, sizeof(m_rcInvalidate));
+	::ZeroMemory(&m_rcRichEditCorner, sizeof(m_rcRichEditCorner));
     m_ptLastMousePos.x = m_ptLastMousePos.y = -1;
 }
 
@@ -148,9 +148,6 @@ CPaintManagerUI::~CPaintManagerUI()
     for( int i = 0; i < m_aAsyncNotify.GetSize(); i++ ) delete static_cast<TNotifyUI*>(m_aAsyncNotify[i]);
     m_mNameHash.Resize(0);
     delete m_pRoot;
-
-	Gdiplus::GdiplusShutdown( m_gdiplusToken );	//  卸载GDI接口
-	delete m_pGdiplusStartupInput;
 
     ::DeleteObject(m_DefaultFontInfo.hFont);
     RemoveAllFonts();
@@ -230,6 +227,8 @@ HANDLE CPaintManagerUI::GetResourceZipHandle()
 void CPaintManagerUI::SetInstance(HINSTANCE hInst)
 {
     m_hInstance = hInst;
+	m_pGdiplusStartupInput = new Gdiplus::GdiplusStartupInput;
+	Gdiplus::GdiplusStartup(&m_gdiplusToken, m_pGdiplusStartupInput, NULL); // 加载GDI+接口
 	CShadowUI::Initialize(hInst);
 }
 
@@ -251,24 +250,47 @@ void CPaintManagerUI::SetResourcePath(LPCTSTR pStrPath)
     if( cEnd != _T('\\') && cEnd != _T('/') ) m_pStrResourcePath += _T('\\');
 }
 
+void CPaintManagerUI::SetResourceZip(UINT nResID)
+{
+	HRSRC hResource = ::FindResource(CPaintManagerUI::GetResourceDll(), MAKEINTRESOURCE(nResID), _T("ZIPRES"));
+	if (hResource == NULL)
+		return;
+	DWORD dwSize = 0;
+	HGLOBAL hGlobal = ::LoadResource(CPaintManagerUI::GetResourceDll(), hResource);
+	if (hGlobal == NULL)
+	{
+		::FreeResource(hResource);
+		return;
+	}
+	dwSize = ::SizeofResource(CPaintManagerUI::GetResourceDll(), hResource);
+	if (dwSize == 0)
+		return;
+
+	CPaintManagerUI::SetResourceZip((LPBYTE)::LockResource(hGlobal), dwSize);
+
+	::FreeResource(hResource);
+}
+
 void CPaintManagerUI::SetResourceZip(LPVOID pVoid, unsigned int len)
 {
     if( m_pStrResourceZip == _T("membuffer") ) return;
-    if( m_bCachedResourceZip && m_hResourceZip != NULL ) {
-        CloseZip((HZIP)m_hResourceZip);
+    if( m_bCachedResourceZip && m_hResourceZip != NULL ) 
+	{
+		ThirdParty::CloseZip(m_hResourceZip);
         m_hResourceZip = NULL;
     }
     m_pStrResourceZip = _T("membuffer");
     m_bCachedResourceZip = true;
     if( m_bCachedResourceZip ) 
-        m_hResourceZip = (HANDLE)OpenZip(pVoid, len, 3);
+        m_hResourceZip = ThirdParty::OpenZip(pVoid, len, 3);
 }
 
 void CPaintManagerUI::SetResourceZip(LPCTSTR pStrPath, bool bCachedResourceZip)
 {
     if( m_pStrResourceZip == pStrPath && m_bCachedResourceZip == bCachedResourceZip ) return;
-    if( m_bCachedResourceZip && m_hResourceZip != NULL ) {
-        CloseZip((HZIP)m_hResourceZip);
+    if( m_bCachedResourceZip && m_hResourceZip != NULL ) 
+	{
+		ThirdParty::CloseZip(m_hResourceZip);
         m_hResourceZip = NULL;
     }
     m_pStrResourceZip = pStrPath;
@@ -276,7 +298,7 @@ void CPaintManagerUI::SetResourceZip(LPCTSTR pStrPath, bool bCachedResourceZip)
     if( m_bCachedResourceZip ) {
         CDuiString sFile = CPaintManagerUI::GetResourcePath();
         sFile += CPaintManagerUI::GetResourceZip();
-        m_hResourceZip = (HANDLE)OpenZip((void*)sFile.GetData(), 0, 2);
+		m_hResourceZip = ThirdParty::OpenZip((void*)sFile.GetData(), 0, 2);
     }
 }
 
@@ -322,6 +344,99 @@ bool CPaintManagerUI::LoadPlugin(LPCTSTR pstrModuleName)
         }
     }
     return false;
+}
+
+TImageInfo* CPaintManagerUI::LoadImage(STRINGorID bitmap, LPCTSTR type, DWORD mask)
+{
+	LPBYTE pData = NULL;
+	DWORD dwSize = 0;
+
+	if (type == NULL)
+	{			
+		if (CPaintManagerUI::GetResourceZip().IsEmpty())
+		{
+			pData = ThirdParty::LoadFromFile(bitmap.m_lpstr, dwSize);
+		}
+		else 
+		{
+			pData = ThirdParty::LoadFromZip(bitmap.m_lpstr, dwSize);
+		}
+	}
+	else 
+	{
+		pData = ThirdParty::LoadFromResource(bitmap.m_lpstr, type, dwSize);
+	}
+
+	if (!pData)
+	{
+		//读不到图片, 则直接去读取bitmap.m_lpstr指向的路径
+		pData = ThirdParty::LoadFromAbsoluteFile(bitmap.m_lpstr, dwSize);
+	}
+
+	if (!pData)
+	{
+		//::MessageBox(0, _T("读取图片数据失败！"), _T("抓BUG"), MB_OK);
+		return NULL;
+	}
+
+	int x, y;
+	LPBYTE pImage = pImage = ThirdParty::ParseImage(pData, dwSize, x, y);
+	delete[] pData;
+	if (!pImage)
+	{
+		return NULL;
+	}
+
+	bool bAlphaChannel = false;
+	LPBYTE pDest = NULL;
+	HBITMAP hBitmap = CRenderEngine::CreateBitmap(NULL, x, y, &pDest);
+	if (!hBitmap) 
+	{
+		return NULL;
+	}
+
+	for (int i = 0; i < x * y; i++)
+	{
+		pDest[i * 4 + 3] = pImage[i * 4 + 3];
+		if (pDest[i * 4 + 3] < 255)
+		{
+			pDest[i * 4] = (BYTE)(DWORD(pImage[i * 4 + 2])*pImage[i * 4 + 3] / 255);
+			pDest[i * 4 + 1] = (BYTE)(DWORD(pImage[i * 4 + 1])*pImage[i * 4 + 3] / 255);
+			pDest[i * 4 + 2] = (BYTE)(DWORD(pImage[i * 4])*pImage[i * 4 + 3] / 255);
+			bAlphaChannel = true;
+		}
+		else
+		{
+			pDest[i * 4] = pImage[i * 4 + 2];
+			pDest[i * 4 + 1] = pImage[i * 4 + 1];
+			pDest[i * 4 + 2] = pImage[i * 4];
+		}
+
+		if (*(DWORD*)(&pDest[i * 4]) == mask) {
+			pDest[i * 4] = (BYTE)0;
+			pDest[i * 4 + 1] = (BYTE)0;
+			pDest[i * 4 + 2] = (BYTE)0;
+			pDest[i * 4 + 3] = (BYTE)0;
+			bAlphaChannel = true;
+		}
+	}
+
+	ThirdParty::FreeImage(pImage);
+
+	TImageInfo* data = new TImageInfo;
+	data->hBitmap = hBitmap;
+	data->nX = x;
+	data->nY = y;
+	data->alphaChannel = bAlphaChannel;
+	return data;
+}
+
+void CPaintManagerUI::FreeImage(const TImageInfo* bitmap)
+{
+	if (bitmap->hBitmap) {
+		::DeleteObject(bitmap->hBitmap);
+	}
+	delete bitmap;
 }
 
 CStdPtrArray* CPaintManagerUI::GetPlugins()
@@ -458,37 +573,81 @@ void CPaintManagerUI::SetTransparent(int nOpacity)
     }
 }
 
-void CPaintManagerUI::SetBackgroundTransparent(bool bTrans)
+void CPaintManagerUI::SetUseLayeredWindow(bool bTrans)
 {
-    m_bAlphaBackground = bTrans;
+    m_bLayeredWindow = bTrans;
 }
 
-bool CPaintManagerUI::IsBackgroundTransparent()
+bool CPaintManagerUI::IsLayeredWindow()
 {
-	return m_bAlphaBackground;
+	return m_bLayeredWindow;
+}
+
+RECT CPaintManagerUI::GetRichEditCorner() const
+{
+	return m_rcRichEditCorner;
+}
+
+void CPaintManagerUI::SetRichEditCorner(const RECT& rcRichedit)
+{
+	m_rcRichEditCorner = rcRichedit;
+}
+
+CRichEditUI* CPaintManagerUI::GetCurrentCaretRichEdit()
+{
+	return m_pCurrentCaretRichedit;
+}
+
+bool CPaintManagerUI::CreateCaret(HBITMAP hBmp, int nWidth, int nHeight)
+{
+	::CreateCaret(m_hWndPaint, hBmp, nWidth, nHeight);
+
+	m_rcCaret.right = m_rcCaret.left + nWidth;
+	m_rcCaret.bottom = m_rcCaret.top + nHeight;
+	return true;
+}
+
+bool CPaintManagerUI::SetCaretPos(CRichEditUI* obj, int x, int y)
+{
+	if (!::SetCaretPos(x, y))
+		return false;
+
+	m_pCurrentCaretRichedit = obj;
+	RECT rcTemp = m_rcCaret;
+	int w = m_rcCaret.right - m_rcCaret.left;
+	int h = m_rcCaret.bottom - m_rcCaret.top;
+	m_rcCaret.left = x;
+	m_rcCaret.top = y;
+	m_rcCaret.right = x + w;
+	m_rcCaret.bottom = y + h;
+
+	Invalidate(rcTemp);
+	Invalidate(m_rcCaret);
+
+	return true;
 }
 
 bool CPaintManagerUI::ShowCaret(bool bShow)
 {
-	if(m_bCaretShowing == bShow)
+	if (m_bCaretShowing == bShow)
 		return true;
 
 	m_bCaretShowing = bShow;
-	if(!bShow)
-	{	
+	if (!bShow)
+	{
 		::KillTimer(m_hWndPaint, kCaretTimerID);
-		if(m_bCaretActive)
+		if (m_bCaretActive)
 		{
-			Invalidate(m_rtCaret);
+			Invalidate(m_rcCaret);
 		}
 		m_bCaretActive = false;
 	}
 	else
 	{
 		::SetTimer(m_hWndPaint, kCaretTimerID, ::GetCaretBlinkTime(), NULL);
-		if(!m_bCaretActive)
+		if (!m_bCaretActive)
 		{
-			Invalidate(m_rtCaret);
+			Invalidate(m_rcCaret);
 			m_bCaretActive = true;
 		}
 	}
@@ -496,58 +655,25 @@ bool CPaintManagerUI::ShowCaret(bool bShow)
 	return true;
 }
 
-bool CPaintManagerUI::SetCaretPos(CRichEditUI* obj, int x, int y)
-{
-	if(!::SetCaretPos(x, y)) 
-		return false;
-
-	m_currentCaretObject = obj;
-	RECT tempRt = m_rtCaret;
-	int w = m_rtCaret.right - m_rtCaret.left;
-	int h = m_rtCaret.bottom - m_rtCaret.top;
-	m_rtCaret.left = x;
-	m_rtCaret.top = y;
-	m_rtCaret.right = x + w;
-	m_rtCaret.bottom = y + h;
-	Invalidate(tempRt);
-	Invalidate(m_rtCaret);
-
-	return true;
-}
-
-CRichEditUI* CPaintManagerUI::GetCurrentCaretObject()
-{
-	return m_currentCaretObject;
-}
-
-bool CPaintManagerUI::CreateCaret(HBITMAP hBmp, int nWidth, int nHeight)
-{
-	::CreateCaret(m_hWndPaint, hBmp, nWidth, nHeight);
-	//TODO hBmp处理位图光标
-	m_rtCaret.right = m_rtCaret.left + nWidth;
-	m_rtCaret.bottom = m_rtCaret.top + nHeight;
-	return true;
-}
-
 void CPaintManagerUI::DrawCaret(HDC hDC, const RECT& rcPaint)
 {
-	if(m_currentCaretObject && (!m_currentCaretObject->IsFocused() || m_hWndPaint != ::GetFocus()))
+	if(m_pCurrentCaretRichedit && (!m_pCurrentCaretRichedit->IsFocused() || m_hWndPaint != ::GetFocus()))
 	{
 		::KillTimer(m_hWndPaint, kCaretTimerID);
 		if(m_bCaretActive)
 		{
-			Invalidate(m_rtCaret);
+			Invalidate(m_rcCaret);
 		}
 		m_bCaretActive = false;
 		return;
 	}
 
-	if(m_bCaretActive && m_bCaretShowing && m_currentCaretObject)
+	if(m_bCaretActive && m_bCaretShowing && m_pCurrentCaretRichedit)
 	{
 		RECT temp = {};
-		if(::IntersectRect(&temp, &rcPaint, &m_rtCaret))
+		if(::IntersectRect(&temp, &rcPaint, &m_rcCaret))
 		{
-			DWORD dwColor = m_currentCaretObject->GetTextColor();
+			DWORD dwColor = m_pCurrentCaretRichedit->GetTextColor();
 			if(dwColor == 0)
 				dwColor = m_dwDefaultFontColor;
 			CRenderEngine::DrawColor(hDC, temp, dwColor);
@@ -586,7 +712,8 @@ bool CPaintManagerUI::PreMessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam,
            // Tabbing between controls
            if( wParam == VK_TAB ) {
                if( m_pFocus && m_pFocus->IsVisible() && m_pFocus->IsEnabled() && _tcsstr(m_pFocus->GetClass(), _T("RichEditUI")) != NULL ) {
-                   if( static_cast<CRichEditUI*>(m_pFocus)->IsWantTab() ) return false;
+                   if( static_cast<CRichEditUI*>(m_pFocus)->IsWantTab() ) 
+					   return false;
                }
                SetNextTabControl(::GetKeyState(VK_SHIFT) >= 0);
                return true;
@@ -731,7 +858,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 			   {
 				   if(m_pRoot->IsUpdateNeeded())
 				   {
-					   if( !::IsIconic(m_hWndPaint))  //redrain修复bug
+					   if( !::IsIconic(m_hWndPaint))
 						   m_pRoot->SetPos(rcClient);
 					   if(m_hDcOffscreen != NULL) ::DeleteDC(m_hDcOffscreen);
 					   if(m_hbmpOffscreen != NULL) ::DeleteObject(m_hbmpOffscreen);
@@ -764,7 +891,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 		   }
 
 		   // 是否开启了半透明窗体模式
-		   if(m_bAlphaBackground)
+		   if(m_bLayeredWindow)
 		   {
 			   // 设置层样式
 			   DWORD dwExStyle = GetWindowLong(m_hWndPaint, GWL_EXSTYLE);
@@ -774,42 +901,54 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 			   RECT rcClient = {0};
 			   GetClientRect(m_hWndPaint, &rcClient);
 			   // 如果窗体从最小化恢复，则刷新整个软件
-			   if (!m_bIsRestore)
+			   if (m_bIsRestore)
 			   {
-				   UnionRect(&rcPaint, &rcPaint, &m_rcInvalidate);
-				   ::ZeroMemory(&m_rcInvalidate, sizeof(m_rcInvalidate));				   
+				   rcPaint = rcClient;
+				   m_bIsRestore = false;		   
 			   }
 			   else
 			   {
-				   rcPaint = rcClient;
-				   m_bIsRestore = false;
+				   UnionRect(&rcPaint, &rcPaint, &m_rcInvalidate);
+				   ::ZeroMemory(&m_rcInvalidate, sizeof(m_rcInvalidate));
 			   }
 			   
 			   int nClientWidth = rcClient.right - rcClient.left;
 			   int nClientHeight = rcClient.bottom - rcClient.top;
-			   if(m_bOffscreenPaint && m_hbmpOffscreen == NULL)
+			   if(m_hbmpOffscreen == NULL)
 			   {
 				   m_hDcOffscreen = ::CreateCompatibleDC(m_hDcPaint);
-				   BITMAPINFO bmi;
-				   ::ZeroMemory(&bmi, sizeof(BITMAPINFO));
-				   bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-				   bmi.bmiHeader.biWidth = nClientWidth;
-				   bmi.bmiHeader.biHeight = -nClientHeight;
-				   bmi.bmiHeader.biPlanes = 1;
-				   bmi.bmiHeader.biBitCount = 32;
-				   bmi.bmiHeader.biCompression = BI_RGB;
-				   bmi.bmiHeader.biSizeImage = nClientWidth * nClientHeight * 4;
-				   bmi.bmiHeader.biClrUsed = 0;
-				   m_hbmpOffscreen = ::CreateDIBSection(m_hDcPaint, &bmi, DIB_RGB_COLORS,
-					   (void**)&m_pBmpOffscreenBits, NULL, 0);
-
+				   m_hbmpOffscreen = CRenderEngine::CreateBitmap(m_hDcPaint, nClientWidth, nClientHeight, &m_pBmpOffscreenBits);
 				   ASSERT(m_hDcOffscreen);
 				   ASSERT(m_hbmpOffscreen);
 			   }
 
 			   HBITMAP hOldBitmap = (HBITMAP)::SelectObject(m_hDcOffscreen, m_hbmpOffscreen);
 			   int iSaveDC = ::SaveDC(m_hDcOffscreen);
-			   CRenderEngine::ClearAlphaPixel(m_pBmpOffscreenBits, nClientWidth, &rcPaint);
+
+#ifdef USE_GDI_RENDER
+			   for(int y = rcPaint.top; y < rcPaint.bottom; ++y)
+			   {
+				   ZeroMemory((unsigned int*)m_pBmpOffscreenBits + y * nClientWidth + rcPaint.left, (rcPaint.right - rcPaint.left) * 4);
+			   }
+#else
+			   //默认使用Gdi+渲染，此时只需要为RichEdit控件修补alpha即可
+			   if (m_rcRichEditCorner.left > 0 || m_rcRichEditCorner.top > 0 || m_rcRichEditCorner.right > 0 || m_rcRichEditCorner.bottom > 0)
+			   {
+				   //获取需要更新的RichEdit范围
+				   RECT rcRichEdit = rcClient;
+				   rcRichEdit.left += m_rcRichEditCorner.left;
+				   rcRichEdit.top += m_rcRichEditCorner.top;
+				   rcRichEdit.right -= m_rcRichEditCorner.right;
+				   rcRichEdit.bottom -= m_rcRichEditCorner.bottom;
+				   if (IntersectRect(&rcRichEdit, &rcRichEdit, &rcPaint))
+				   {
+					   for (int y = rcRichEdit.top; y < rcRichEdit.bottom; ++y)
+					   {
+						   ZeroMemory((unsigned int*)m_pBmpOffscreenBits + y * nClientWidth + rcRichEdit.left, (rcRichEdit.right - rcRichEdit.left) * 4);
+					   }
+				   }
+			   }
+#endif
 			   m_pRoot->DoPaint(m_hDcOffscreen, rcPaint);
 			   DrawCaret(m_hDcOffscreen, rcPaint);
 			   for(int i = 0; i < m_aPostPaintControls.GetSize(); i++)
@@ -817,7 +956,46 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 				   CControlUI* pPostPaintControl = static_cast<CControlUI*>(m_aPostPaintControls[i]);
 				   pPostPaintControl->DoPostPaint(m_hDcOffscreen, ps.rcPaint);
 			   }
-			   CRenderEngine::RestoreAlphaColor(m_pBmpOffscreenBits, nClientWidth, &rcPaint);
+
+#ifdef USE_GDI_RENDER
+			   for (int y = rcPaint.top; y < rcPaint.bottom; ++y)
+			   {
+				   for (int x = rcPaint.left; x < rcPaint.right; ++x)
+				   {				   
+					   int i = (y*nClientWidth + x) * 4;
+					   if ((m_pBmpOffscreenBits[i + 3] == 0) &&
+						   (m_pBmpOffscreenBits[i + 0] != 0 ||
+						   m_pBmpOffscreenBits[i + 1] != 0 ||
+						   m_pBmpOffscreenBits[i + 2] != 0))
+					   {
+						   m_pBmpOffscreenBits[i + 3] = 255;
+					   }
+						   
+				   }
+			   }
+#else
+			   //默认使用Gdi+渲染，此时只需要为RichEdit控件修补alpha即可
+			   if (m_rcRichEditCorner.left > 0 || m_rcRichEditCorner.top > 0 || m_rcRichEditCorner.right > 0 || m_rcRichEditCorner.bottom > 0)
+			   {
+				   //获取需要更新的RichEdit范围
+				   RECT rcRichEdit = rcClient;
+				   rcRichEdit.left += m_rcRichEditCorner.left;
+				   rcRichEdit.top += m_rcRichEditCorner.top;
+				   rcRichEdit.right -= m_rcRichEditCorner.right;
+				   rcRichEdit.bottom -= m_rcRichEditCorner.bottom;
+				   if (IntersectRect(&rcRichEdit, &rcRichEdit, &rcPaint))
+				   {
+					   for (int y = rcRichEdit.top; y < rcRichEdit.bottom; ++y)
+					   {
+						   for (int x = rcRichEdit.left; x < rcRichEdit.right; ++x)
+						   {
+								int i = (y*nClientWidth + x) * 4;
+								m_pBmpOffscreenBits[i + 3] = 255;
+						   }
+					   }
+				   }
+			   }
+#endif
 			   ::RestoreDC(m_hDcOffscreen, iSaveDC);
 
 			   // 贴到主窗体
@@ -834,7 +1012,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 		   }
 		   else
 		   {
-			   if(m_bOffscreenPaint && m_hbmpOffscreen == NULL)
+			   if(m_hbmpOffscreen == NULL)
 			   {
 				   RECT rcClient = {0};
 				   ::GetClientRect(m_hWndPaint, &rcClient);
@@ -844,32 +1022,19 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 				   ASSERT(m_hbmpOffscreen);
 			   }
 
-			   if(m_bOffscreenPaint)
-			   {
-				   HBITMAP hOldBitmap = (HBITMAP) ::SelectObject(m_hDcOffscreen, m_hbmpOffscreen);
-				   int iSaveDC = ::SaveDC(m_hDcOffscreen);
-				   m_pRoot->DoPaint(m_hDcOffscreen, ps.rcPaint);
-				   DrawCaret(m_hDcOffscreen, ps.rcPaint);
-				   for(int i = 0; i < m_aPostPaintControls.GetSize(); i++)
-				   {
-					   CControlUI* pPostPaintControl = static_cast<CControlUI*>(m_aPostPaintControls[i]);
-					   pPostPaintControl->DoPostPaint(m_hDcOffscreen, ps.rcPaint);
-				   }
-				   ::RestoreDC(m_hDcOffscreen, iSaveDC);
-				   ::BitBlt(ps.hdc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
-					   ps.rcPaint.bottom - ps.rcPaint.top, m_hDcOffscreen, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
-				   ::SelectObject(m_hDcOffscreen, hOldBitmap);
-
-			   }
-			   else
-			   {
-				   // A standard paint job
-				   int iSaveDC = ::SaveDC(ps.hdc);
-				   m_pRoot->DoPaint(ps.hdc, ps.rcPaint);
-				   DrawCaret(ps.hdc, ps.rcPaint);
-				   ::RestoreDC(ps.hdc, iSaveDC);
-			   }
-
+				HBITMAP hOldBitmap = (HBITMAP) ::SelectObject(m_hDcOffscreen, m_hbmpOffscreen);
+				int iSaveDC = ::SaveDC(m_hDcOffscreen);
+				m_pRoot->DoPaint(m_hDcOffscreen, ps.rcPaint);
+				DrawCaret(m_hDcOffscreen, ps.rcPaint);
+				for(int i = 0; i < m_aPostPaintControls.GetSize(); i++)
+				{
+					CControlUI* pPostPaintControl = static_cast<CControlUI*>(m_aPostPaintControls[i]);
+					pPostPaintControl->DoPostPaint(m_hDcOffscreen, ps.rcPaint);
+				}
+				::RestoreDC(m_hDcOffscreen, iSaveDC);
+				::BitBlt(ps.hdc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
+					ps.rcPaint.bottom - ps.rcPaint.top, m_hDcOffscreen, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+				::SelectObject(m_hDcOffscreen, hOldBitmap);
 		   }
 
 		   // All Done!
@@ -915,12 +1080,13 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
         return true;
 	case WM_TIMER:
 		{
-			if(kCaretTimerID == LOWORD(wParam)){
-				//DUI__Trace(_T("WM_TIMER:%d (%d,%d)"), m_bCaretActive, m_rtCaret.left, m_rtCaret.top);
-				Invalidate(m_rtCaret);
+			if(kCaretTimerID == LOWORD(wParam))
+			{
+				Invalidate(m_rcCaret);
 				m_bCaretActive = !m_bCaretActive;
 			}
-			else{
+			else
+			{
 				for( int i = 0; i < m_aTimers.GetSize(); i++ ) {
 					const TIMERINFO* pTimer = static_cast<TIMERINFO*>(m_aTimers[i]);
 					if(pTimer->hWnd == m_hWndPaint && 
@@ -1262,8 +1428,16 @@ void CPaintManagerUI::NeedUpdate()
 
 void CPaintManagerUI::Invalidate(RECT& rcItem)
 {
-    ::InvalidateRect(m_hWndPaint, &rcItem, FALSE);
-	m_rcInvalidate = rcItem;
+	if (rcItem.left < 0) rcItem.left = 0;
+	if (rcItem.top < 0) rcItem.top = 0;
+	if (rcItem.right < rcItem.left) rcItem.right = rcItem.left;
+	if (rcItem.bottom < rcItem.top) rcItem.bottom = rcItem.top;
+	if (m_bLayeredWindow)
+	{
+		::UnionRect(&m_rcInvalidate, &m_rcInvalidate, &rcItem);
+	}
+		
+	::InvalidateRect(m_hWndPaint, &rcItem, FALSE);
 
 }
 
@@ -1382,25 +1556,24 @@ void CPaintManagerUI::RemoveAllOptionGroups()
 void CPaintManagerUI::MessageLoop()
 {
     MSG msg = { 0 };
-    while( ::GetMessage(&msg, NULL, 0, 0) ) {
-        if( !CPaintManagerUI::TranslateMessage(&msg) ) {
+    while( ::GetMessage(&msg, NULL, 0, 0) ) 
+	{
+        if( !CPaintManagerUI::TranslateMessage(&msg) ) 
+		{
             ::TranslateMessage(&msg);
-			try{
             ::DispatchMessage(&msg);
-			} catch(...) {
-				DUITRACE(_T("EXCEPTION: %s(%d)\n"), __FILET__, __LINE__);
-				#ifdef _DEBUG
-				throw "CPaintManagerUI::MessageLoop";
-				#endif
-			}
         }
     }
 }
 
 void CPaintManagerUI::Term()
 {
-    if( m_bCachedResourceZip && m_hResourceZip != NULL ) {
-        CloseZip((HZIP)m_hResourceZip);
+	Gdiplus::GdiplusShutdown(m_gdiplusToken);	//  卸载GDI+接口
+	delete m_pGdiplusStartupInput;
+
+    if( m_bCachedResourceZip && m_hResourceZip != NULL )
+	{
+        ThirdParty::CloseZip(m_hResourceZip);
         m_hResourceZip = NULL;
     }
 }
@@ -2071,11 +2244,11 @@ const TImageInfo* CPaintManagerUI::AddImage(LPCTSTR bitmap, LPCTSTR type, DWORD 
         if( isdigit(*bitmap) ) {
             LPTSTR pstr = NULL;
             int iIndex = _tcstol(bitmap, &pstr, 10);
-            data = CRenderEngine::LoadImage(iIndex, type, mask);
+            data = CPaintManagerUI::LoadImage(iIndex, type, mask);
         }
     }
     else {
-        data = CRenderEngine::LoadImage(bitmap, NULL, mask);
+		data = CPaintManagerUI::LoadImage(bitmap, NULL, mask);
     }
 
     if( !data ) return NULL;
@@ -2113,7 +2286,7 @@ bool CPaintManagerUI::RemoveImage(LPCTSTR bitmap)
     const TImageInfo* data = GetImage(bitmap);
     if( !data ) return false;
 
-    CRenderEngine::FreeImage(data) ;
+	CPaintManagerUI::FreeImage(data);
 
     return m_mImageHash.Remove(bitmap);
 }
@@ -2125,7 +2298,7 @@ void CPaintManagerUI::RemoveAllImages()
         if(LPCTSTR key = m_mImageHash.GetAt(i)) {
             data = static_cast<TImageInfo*>(m_mImageHash.Find(key, false));
 			if (data) {
-				CRenderEngine::FreeImage(data);
+				CPaintManagerUI::FreeImage(data);
 			}
         }
     }
@@ -2145,11 +2318,11 @@ void CPaintManagerUI::ReloadAllImages()
                     if( isdigit(*bitmap) ) {
                         LPTSTR pstr = NULL;
                         int iIndex = _tcstol(bitmap, &pstr, 10);
-                        pNewData = CRenderEngine::LoadImage(iIndex, data->sResType.GetData(), data->dwMask);
+						pNewData = CPaintManagerUI::LoadImage(iIndex, data->sResType.GetData(), data->dwMask);
                     }
                 }
                 else {
-                    pNewData = CRenderEngine::LoadImage(bitmap, NULL, data->dwMask);
+					pNewData = CPaintManagerUI::LoadImage(bitmap, NULL, data->dwMask);
                 }
                 if( pNewData == NULL ) continue;
 
@@ -2360,7 +2533,7 @@ bool CPaintManagerUI::TranslateAccelerator(LPMSG pMsg)
 	return false;
 }
 
-bool CPaintManagerUI::TranslateMessage(const LPMSG pMsg)
+bool CPaintManagerUI::TranslateMessage(const MSG* pMsg)
 {
 	// Pretranslate Message takes care of system-wide messages, such as
 	// tabbing and shortcut key-combos. We'll look for all messages for
@@ -2380,7 +2553,7 @@ bool CPaintManagerUI::TranslateMessage(const LPMSG pMsg)
 			{
 				if(pMsg->hwnd == pT->GetPaintWindow() || hTempParent == pT->GetPaintWindow())
 				{
-					if (pT->TranslateAccelerator(pMsg))
+					if (pT->TranslateAccelerator(const_cast<LPMSG>(pMsg)))
 						return true;
 
 					pT->PreMessageHandler(pMsg->message, pMsg->wParam, pMsg->lParam, lRes);
@@ -2400,7 +2573,7 @@ bool CPaintManagerUI::TranslateMessage(const LPMSG pMsg)
 			CPaintManagerUI* pT = static_cast<CPaintManagerUI*>(m_aPreMessages[i]);
 			if(pMsg->hwnd == pT->GetPaintWindow())
 			{
-				if (pT->TranslateAccelerator(pMsg))
+				if (pT->TranslateAccelerator(const_cast<LPMSG>(pMsg)))
 					return true;
 
 				if( pT->PreMessageHandler(pMsg->message, pMsg->wParam, pMsg->lParam, lRes) ) 
@@ -2435,5 +2608,6 @@ void CPaintManagerUI::UsedVirtualWnd(bool bUsed)
 {
 	m_bUsedVirtualWnd = bUsed;
 }
+
 
 } // namespace DuiLib
